@@ -1,3 +1,6 @@
+import json
+import re
+
 import scrapy
 from auto_ria.items import CarItem
 from datetime import datetime
@@ -67,10 +70,63 @@ class AutoRiaSpider(scrapy.Spider):
 
         item['datetime_found'] = datetime.utcnow()
 
-        self.logger.info(f"Parsed: {item['title']}")
-        yield item
+        advertisement_id_match = re.search(r'_(\d+)\.html$', response.url)
+        if not advertisement_id_match:
+            self.logger.warning(f'advertisement_id is not found in URL: {response.url}')
+            yield item
+            return
+
+        advertisement_id = advertisement_id_match.group(1)
+
+        user_id = response.css(f"script[data-advertisement-id='{advertisement_id}']").attrib.get("data-owner-id")
+
+        if not user_id:
+            self.logger.warning(f'data-owner-id is not found for URL: {response.url}')
+            yield item
+            return
+
+        phone_hash = response.css(f'script.js-user-secure-{user_id}::attr(data-hash)').get()
+        expires = response.css(f'script.js-user-secure-{user_id}::attr(data-expires)').get()
+
+        if phone_hash and expires:
+            phone_url = f'https://auto.ria.com/users/phones/{advertisement_id}?hash={phone_hash}&expires={expires}'
+            yield scrapy.Request(
+                url=phone_url,
+                callback=self.parse_phone,
+                meta={'item': item},
+                headers={
+                    'Referer': response.url,
+                    'X-Requested-With': 'XMLHttpRequest'
+                }
+            )
+        else:
+            yield item
 
     def extract_text(self, response, label):
         xpath_expr = f"//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{label.lower()}')]/following-sibling::span[1]/text()"
         node = response.xpath(xpath_expr).get()
         return node.strip() if node else None
+
+    def parse_phone(self, response):
+        item = response.meta['item']
+        try:
+            data = json.loads(response.text)
+            item['phone_number'] = self.normalize_phone(data.get('formattedPhoneNumber'))
+        except Exception as e:
+            self.logger.warning(f"Cannot parse phone_number: {e}")
+
+        yield item
+
+    @staticmethod
+    def normalize_phone(phone):
+        digits = re.sub(r'\D', '', phone)
+
+        if len(digits) == 10 and digits.startswith('0'):
+            return '+38' + digits
+
+        if len(digits) == 12 and digits.startswith('380'):
+            return '+' + digits
+
+        return None
+
+
